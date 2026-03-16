@@ -127,6 +127,8 @@ def train(args):
     if use_cuda:
         device = torch.device("cuda:0")
 
+    l1_loss = nn.L1Loss()
+
     # if use multi gpus
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     distributed_gpu = n_gpu>1
@@ -158,7 +160,8 @@ def train(args):
 
     print("now the rank is :",get_rank()) # model init
     # GRIG generator
-    netG = GRIG_G(ngf=ngf, nc=nc, nz=nz,im_size=im_size).train()
+    print(device)
+    netG = GRIG_G(ngf=ngf, nc=nc+2, nz=nz,im_size=im_size).train()
     netG.apply(weights_init)
     netG.to(device)
 
@@ -175,10 +178,10 @@ def train(args):
     patch_D = ForgeryPatchDiscriminator(input_nc=3, ndf=64, n_layers=3)
     patch_D.apply(weights_init)
     patch_D.to(device)
-    #
-    print_networks(netG,name="netG")
-    print_networks(netD,name="netD")
-    print_networks(patch_D,name="patch_D")
+    #PRINT NETWORK
+    # print_networks(netG,name="netG")
+    # print_networks(netD,name="netD")
+    # print_networks(patch_D,name="patch_D")
     #optimizer for each model - MODDED
     optimizerG = optim.AdamW(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999), weight_decay=1e-3, eps=1e-8)
     optimizerD = optim.AdamW(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999), weight_decay=1e-3, eps=1e-8)
@@ -247,19 +250,20 @@ def train(args):
     )
 
     # dataset = ImageFolder(root=data_root, transform=transform_list,im_size=(im_size,im_size))
+    print(data_root)
+    print(os.listdir(data_root))
     dataset = ArtPaintingDataset(images_dir = data_root,
                                         mask_dir= os.path.join('../data/dtd/images'),
                                         transforms=test_transform,
                                         img_size=im_size,
                                         n_subsets=50,
-                                        # class_names=self.config.data.class_names)
-            )
+                                        class_names=None)
     test_dataset = ArtPaintingDataset(images_dir = test_root,
                                         mask_dir= os.path.join('../data/dtd/images'),
                                         transforms=test_transform,
                                         img_size=im_size,
                                         n_subsets=5,
-                                        # class_names=self.config.data.class_names,
+                                        class_names=None,
                                         split = 'test')
     print('Datasets', 'Train',len(dataset),'Test',len(test_dataset), 'All classes', dataset.class_names)
     # test_dataset = ImageFolder_CenterCrop(root=test_root, transform=test_transform,im_size=(im_size,im_size))
@@ -297,6 +301,8 @@ def train(args):
         count+=1
         ##get data
         im_in, mask_01, real_image_, img_file, mask_file= next(dl)
+        im_in = im_in.cuda(non_blocking=True)
+        mask_01 = mask_01.cuda(non_blocking=True)
         real_image_ = real_image_.cuda(non_blocking=True)
 
         if args.aug == True:
@@ -317,7 +323,7 @@ def train(args):
             print('At substep', kk)
 
             ##get fake data
-            residual_out = netG(residual_input.detach(),mask_01.detach())
+            residual_out = netG(residual_input.detach(),im_in.detach())#mask_01.detach()
             pre_imgs = residual_out+residual_input
             # completed_img
             completed_img = get_completion(pred=pre_imgs, gt=real_image, mask_01=mask_01)
@@ -375,7 +381,8 @@ def train(args):
             #should calculate every time, otherwiese, the performance is not good
             g_percept_loss = percept(completed_img, real_image.detach()).sum() * 1.5
             loss_dict["g_percept_loss"] = g_percept_loss
-            err_g += g_percept_loss
+            loss_dict["l1_loss"] = l1_loss(completed_img, real_image.detach())
+            err_g += g_percept_loss + loss_dict['l1_loss']
 
             err_g.backward()
             optimizerG.step()

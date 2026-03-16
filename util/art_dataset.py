@@ -206,8 +206,10 @@ class ArtPaintingDataset(Dataset):
         img = self.preprocess(img, self.scale, self.img_size)
         masked = self.preprocess(masked, self.scale, self.img_size)
         mask = self.preprocess(mask, self.scale, self.img_size)
+
+        mask = np.repeat(mask, 3, axis=2)
         
-        return self.transforms(masked), self.transforms(mask), self.transforms(img), str(img_file), str(mask_file)
+        return self.transforms(masked), torch.mean(self.transforms(mask), dim=0, keepdim=True), self.transforms(img), str(img_file), str(mask_file)
 
 class ArtPainting:
     def __init__(self, config):
