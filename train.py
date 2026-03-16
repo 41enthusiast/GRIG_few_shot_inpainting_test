@@ -7,21 +7,22 @@ import torch
 from torch import nn
 import torch.optim as optim
 import torch.nn.functional as F
+from util.art_dataset import *
 from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms
 from torchvision import utils as vutils
 from torch.utils import data
 import argparse
 from tqdm import tqdm
-from models.models import weights_init,GRIG_G
+from models.models import weights_init, GRIG_G
 
 from util.utils import print_networks
 from util.operation import copy_dirs,copy_Dir2Dir
 from pg_modules.discriminator import ProjectedDiscriminator,ForgeryPatchDiscriminator
-from util.operation import copy_G_params, load_params, get_dir,get_mask,get_completion
+from util.operation import copy_G_params, load_params, get_dir, get_mask, get_completion
 from util.utils import co_mod_mask
-from util.operation import ImageFolder,ImageFolder_CenterCrop
-from diffaug import DiffAugment,DiffAugment_withsame_trans
+from util.operation import ImageFolder, ImageFolder_CenterCrop
+from diffaug import DiffAugment, DiffAugment_withsame_trans
 import shutil
 import gc
 import os
@@ -38,7 +39,8 @@ color_policy = 'color'
 import Lpips
 from Logger.Logger import Logger
 from Logger.Scorer import ScoreManager
-from test_util import get_metric_score,Reinference_v2
+from test_util import get_metric_score, Reinference_v2
+import wandb
 
 percept = Lpips.PerceptualLoss(model='net-lin', net='vgg', use_gpu=True)
 
@@ -177,10 +179,10 @@ def train(args):
     print_networks(netG,name="netG")
     print_networks(netD,name="netD")
     print_networks(patch_D,name="patch_D")
-    #optimizer for each model
-    optimizerG = optim.Adam(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
-    optimizerD = optim.Adam(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
-    optimizerPatchD = optim.Adam(patch_D.parameters(), lr=nlr, betas=(nbeta1, 0.999))
+    #optimizer for each model - MODDED
+    optimizerG = optim.AdamW(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999), weight_decay=1e-3, eps=1e-8)
+    optimizerD = optim.AdamW(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999), weight_decay=1e-3, eps=1e-8)
+    optimizerPatchD = optim.AdamW(patch_D.parameters(), lr=nlr, betas=(nbeta1, 0.999), weight_decay=1e-3, eps=1e-8)
 
     avg_param_G = copy_G_params(netG)
 
@@ -244,16 +246,31 @@ def train(args):
         ]
     )
 
-    dataset = ImageFolder(root=data_root, transform=transform_list,im_size=(im_size,im_size))
-    test_dataset = ImageFolder_CenterCrop(root=test_root, transform=test_transform,im_size=(im_size,im_size))
+    # dataset = ImageFolder(root=data_root, transform=transform_list,im_size=(im_size,im_size))
+    dataset = ArtPaintingDataset(images_dir = data_root,
+                                        mask_dir= os.path.join('../data/dtd/images'),
+                                        transforms=test_transform,
+                                        img_size=im_size,
+                                        n_subsets=50,
+                                        # class_names=self.config.data.class_names)
+            )
+    test_dataset = ArtPaintingDataset(images_dir = test_root,
+                                        mask_dir= os.path.join('../data/dtd/images'),
+                                        transforms=test_transform,
+                                        img_size=im_size,
+                                        n_subsets=5,
+                                        # class_names=self.config.data.class_names,
+                                        split = 'test')
+    print('Datasets', 'Train',len(dataset),'Test',len(test_dataset), 'All classes', dataset.class_names)
+    # test_dataset = ImageFolder_CenterCrop(root=test_root, transform=test_transform,im_size=(im_size,im_size))
 
     dataloader = DataLoader(dataset, batch_size=batch_size,
-                                 sampler=data_sampler(dataset, shuffle=True, distributed=distributed_gpu),
+                                #  sampler=data_sampler(dataset, shuffle=True, distributed=distributed_gpu),
                                  num_workers=args.num_workers, drop_last=True, pin_memory=True)
-    dataloader = sample_data(dataloader)
+    # dataloader = sample_data(dataloader)
     test_loader = DataLoader(
         test_dataset,batch_size=batch_size,
-        sampler=data_sampler(test_dataset, shuffle=False, distributed=False),
+        # sampler=data_sampler(test_dataset, shuffle=False, distributed=False),
         num_workers=args.num_workers, drop_last=False,)
 
     if get_rank() == 0:
@@ -272,11 +289,14 @@ def train(args):
     loss_dict = {}
 
     count =0
+    steps_per_epoch = len(dataloader)
+    dl = iter(dataloader)
     for iteration in tqdm(range(current_iteration, total_iterations+1)):
         # if args.debug == True and count>10:break
+        print('At training step', iteration)
         count+=1
         ##get data
-        real_image_ = next(dataloader)
+        im_in, mask_01, real_image_, img_file, mask_file= next(dl)
         real_image_ = real_image_.cuda(non_blocking=True)
 
         if args.aug == True:
@@ -286,7 +306,7 @@ def train(args):
             real_image = real_image_
 
         ##get mask
-        gin, mask_01, im_in = co_mod_mask(real_image, im_size=im_size)
+        # gin, mask_01, im_in = co_mod_mask(real_image, im_size=im_size)#gin not used here
 
         residual_input = im_in.detach() #the first input
         out_list = []  #saving outputs from each residual inpainting iteration
@@ -294,6 +314,7 @@ def train(args):
         seg_list = []  # predictions from forgery-patch discriminator
         mask_label_list = []  #corresponding mask labels
         for kk in range(args.reinpaint_iter):
+            print('At substep', kk)
 
             ##get fake data
             residual_out = netG(residual_input.detach(),mask_01.detach())
@@ -362,10 +383,21 @@ def train(args):
 
             residual_input = completed_img.detach()
 
+            if get_rank() == 0:
+                sub_iter_logs = {f"sub_iter/{k}": v.item() for k, v in loss_dict.items()}
+                sub_iter_logs["kk_step"] = kk
+                # We use commit=False so it doesn't increment the global step counter yet
+                wandb.log(sub_iter_logs, commit=False)
+
         # reduced is mast incorprated into the code, otherwise
         #Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
         #will happen
         loss_reduced = reduce_loss_dict(loss_dict)
+        if get_rank() == 0:
+            master_logs = {f"global/{k}": v.mean().item() for k, v in loss_reduced.items()}
+            master_logs["iteration"] = iteration
+            master_logs["lr/G"] = optimizerG.param_groups[0]['lr']
+            wandb.log(master_logs)
         D_loss_val = loss_reduced["D_loss"].mean().item()
         G_loss_val = loss_reduced["G_loss"].mean().item()
         g_percept_loss_val = loss_reduced["g_percept_loss"].mean().item()
@@ -399,6 +431,10 @@ def train(args):
                 'opt_patch_d': optimizerPatchD.state_dict(),
                 'iter': iteration, 'metrics': score_manager.get_all_dic()},
                 saved_model_folder + '/a_recent_model2.pth')
+            scores_dict = score_manager.get_all_dic()
+            master_logs = {f"scores/{k}": v.mean().item() for k, v in scores_dict.items()}
+            master_logs["iteration"] = iteration
+            wandb.log(master_logs)
             load_params(g_module, backup_para)
 
 
@@ -450,6 +486,18 @@ def train(args):
                         copy_Dir2Dir(args.eval_dir,args.eval_best_dir,num=120)
             synchronize()
 
+        if iteration % steps_per_epoch == 0:
+            random.shuffle(dataset.shuffled_ids)
+            dataloader = DataLoader(dataset, batch_size=batch_size,
+                                #  sampler=data_sampler(dataset, shuffle=True, distributed=distributed_gpu),
+                                 num_workers=args.num_workers, drop_last=True, pin_memory=True)
+            dl = iter(dataloader)
+            # test_loader = DataLoader(
+            #     test_dataset,batch_size=batch_size,
+            #     # sampler=data_sampler(test_dataset, shuffle=False, distributed=False),
+            #     num_workers=args.num_workers, drop_last=False,)
+
+
 
 
 
@@ -490,6 +538,14 @@ if __name__ == "__main__":
     ###fid
     args = parser.parse_args()
     print(args)
+
+    if get_rank() == 0:
+        wandb.init(
+            project="GRIG-Inpainting",
+            name=args.name,
+            config=args,
+            resume="allow" if args.resume else None
+        )
 
     #train and test
     train(args)

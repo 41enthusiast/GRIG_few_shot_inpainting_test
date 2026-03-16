@@ -74,11 +74,13 @@ def Reinference_v2(args,netG,test_loader,eval_dict):
             for i, data in tqdm(enumerate(test_loader)):
                 if args.debug == True and count > 10: break
                 count += 1
-                real_image = data
+                im_in, mask, real_image = data
+                mask_01 = mask.cuda()
+                im_in = im_in.cuda()
                 real_image = real_image.cuda()
 
-                gin, gt_local, mask, mask_01, im_in = get_mask(real_image, mask_type='center', im_size= real_image.shape[2],
-                                                mask_shapes= [real_image.shape[2]//2,real_image.shape[2]//2])
+                # gin, gt_local, mask, mask_01, im_in = get_mask(real_image, mask_type='center', im_size= real_image.shape[2],
+                #                                 mask_shapes= [real_image.shape[2]//2,real_image.shape[2]//2])
 
                 residual_input = im_in
                 for kk in range(args.reinpaint_iter):
